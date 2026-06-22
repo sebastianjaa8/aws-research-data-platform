@@ -1,6 +1,6 @@
 """
 Hybrid retrieval: dense (pgvector cosine) + sparse (PostgreSQL full-text search).
-Results fused via Reciprocal Rank Fusion, then returned for Claude reranking.
+Results fused via Reciprocal Rank Fusion, then returned for Claude generation.
 Row-Level Security on the DB enforces per-researcher data isolation automatically.
 """
 import boto3
@@ -21,6 +21,7 @@ def embed_query(text: str) -> list[float]:
 
 def dense_search(cur, query_vec: list[float], k: int) -> list[tuple]:
     """pgvector cosine similarity search. RLS filters rows by researcher automatically."""
+    cur.execute("SET LOCAL ivfflat.probes = 10")   # recall tuning: ~sqrt(lists=100)
     cur.execute("""
         SELECT id, content, metadata,
                1 - (embedding <=> %s::vector) AS score
@@ -32,7 +33,7 @@ def dense_search(cur, query_vec: list[float], k: int) -> list[tuple]:
 
 
 def sparse_search(cur, query: str, k: int) -> list[tuple]:
-    """PostgreSQL full-text search. RLS filters rows by researcher automatically."""
+    """PostgreSQL full-text search (ts_rank). RLS filters rows by researcher automatically."""
     cur.execute("""
         SELECT id, content, metadata,
                ts_rank(to_tsvector('english', content),
@@ -48,7 +49,7 @@ def sparse_search(cur, query: str, k: int) -> list[tuple]:
 def reciprocal_rank_fusion(
     dense_rows: list[tuple],
     sparse_rows: list[tuple],
-    k: int = 10,
+    k: int = 8,
     rrf_k: int = 60,
 ) -> list[dict]:
     """
@@ -76,8 +77,12 @@ def reciprocal_rank_fusion(
 def retrieve(conn, query: str, k: int = 8) -> list[dict]:
     """
     Main entry point. Session variable app.researcher_id must be set before calling
-    (enforced by auth middleware) so RLS policies apply to both searches.
+    (enforced by set_researcher_context) so RLS policies apply to both searches.
     """
+    with conn.cursor() as cur:
+        cur.execute("SELECT current_setting('app.researcher_id', true)")
+        if not cur.fetchone()[0]:
+            raise RuntimeError("researcher context not set — call set_researcher_context before retrieve")
     query_vec = embed_query(query)
     with conn.cursor() as cur:
         dense  = dense_search(cur,  query_vec, k * 2)

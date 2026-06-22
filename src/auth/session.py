@@ -4,8 +4,9 @@ Validates RS256-signed tokens from Auth0, extracts the researcher ID (sub claim)
 and sets it as a PostgreSQL session variable so Row-Level Security policies apply.
 """
 import os
-from functools import lru_cache
+import threading
 
+from cachetools import TTLCache
 import jwt
 import psycopg2
 import requests
@@ -14,11 +15,16 @@ AUTH0_DOMAIN   = os.environ["AUTH0_DOMAIN"]     # e.g. "your-tenant.us.auth0.com
 AUTH0_AUDIENCE = os.environ["AUTH0_AUDIENCE"]   # e.g. "https://api.research-platform.io"
 JWKS_URL       = f"https://{AUTH0_DOMAIN}/.well-known/jwks.json"
 
+_jwks_cache = TTLCache(maxsize=1, ttl=3600)  # refresh hourly for key rotation
+_jwks_lock  = threading.Lock()
 
-@lru_cache(maxsize=1)
+
 def _get_jwks() -> dict:
-    """Cached fetch of Auth0 public keys. Cache avoids per-request JWKS calls."""
-    return requests.get(JWKS_URL, timeout=5).json()
+    """TTL-cached fetch of Auth0 public keys (refreshed hourly to handle key rotation)."""
+    with _jwks_lock:
+        if "jwks" not in _jwks_cache:
+            _jwks_cache["jwks"] = requests.get(JWKS_URL, timeout=5).json()
+        return _jwks_cache["jwks"]
 
 
 def validate_token(token: str) -> dict:
@@ -28,7 +34,9 @@ def validate_token(token: str) -> dict:
     """
     header  = jwt.get_unverified_header(token)
     jwks    = _get_jwks()
-    key     = next(k for k in jwks["keys"] if k["kid"] == header["kid"])
+    key     = next((k for k in jwks["keys"] if k["kid"] == header["kid"]), None)
+    if key is None:
+        raise jwt.InvalidTokenError(f"Unknown kid: {header['kid']}")
     pub_key = jwt.algorithms.RSAAlgorithm.from_jwk(key)
 
     return jwt.decode(
@@ -45,6 +53,9 @@ def set_researcher_context(conn: psycopg2.extensions.connection, token: str) -> 
     """
     Validates token, then sets app.researcher_id as a PostgreSQL session variable.
     PostgreSQL RLS policies read this variable to enforce per-researcher isolation.
+
+    NOTE: caller must not commit between this call and the subsequent query — the
+    SET LOCAL is transaction-scoped and resets on commit/rollback.
 
     Returns the researcher_id (Auth0 sub claim) for use in application logic.
     """

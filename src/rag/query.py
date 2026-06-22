@@ -13,6 +13,8 @@ from src.rag.retrieval import retrieve
 
 bedrock = boto3.client("bedrock-runtime", region_name=os.environ.get("AWS_REGION", "us-east-1"))
 
+MODEL_ID = "anthropic.claude-3-5-sonnet-20241022-v2:0"
+
 SYSTEM_PROMPT = """You are a research assistant for a neuroscience lab.
 Answer questions using only the experiment data provided below.
 Be precise. Cite specific sessions and instruments when relevant.
@@ -25,6 +27,7 @@ def answer(conn, question: str, token: str) -> dict:
       1. Validate JWT and set researcher context (enforces RLS)
       2. Retrieve relevant experiment chunks via hybrid search
       3. Synthesize answer with Claude via Bedrock
+      4. Log query to audit table for IRB compliance
     """
     researcher_id = set_researcher_context(conn, token)
     chunks        = retrieve(conn, question)
@@ -38,7 +41,7 @@ def answer(conn, question: str, token: str) -> dict:
     prompt = f"Experiment data:\n{context}\n\nQuestion: {question}"
 
     response = bedrock.invoke_model(
-        modelId="anthropic.claude-3-sonnet-20240229-v1:0",
+        modelId=MODEL_ID,
         body=json.dumps({
             "anthropic_version": "bedrock-2023-05-31",
             "max_tokens": 1024,
@@ -48,10 +51,17 @@ def answer(conn, question: str, token: str) -> dict:
     )
     answer_text = json.loads(response["body"].read())["content"][0]["text"]
 
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO query_log (researcher_id, question, chunks_used) VALUES (%s, %s, %s)",
+            (researcher_id, question, len(chunks)),
+        )
+    conn.commit()
+
     return {
-        "answer":       answer_text,
+        "answer":        answer_text,
         "researcher_id": researcher_id,
-        "sources":      [{"id": c["id"], "content": c["content"][:120]} for c in chunks],
+        "sources":       [{"id": c["id"], "content": c["content"][:120]} for c in chunks],
     }
 
 
@@ -64,9 +74,11 @@ if __name__ == "__main__":
     parser.add_argument("--token",    required=True, help="Auth0 JWT")
     args = parser.parse_args()
 
-    conn   = psycopg2.connect(os.environ["DATABASE_URL"])
-    result = answer(conn, args.question, args.token)
-    conn.close()
+    conn = psycopg2.connect(os.environ["DATABASE_URL"])
+    try:
+        result = answer(conn, args.question, args.token)
+    finally:
+        conn.close()
 
     print(f"\nAnswer:\n{result['answer']}")
     print(f"\nSources used: {len(result['sources'])}")

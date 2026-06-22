@@ -50,17 +50,26 @@ ALTER TABLE experiment_chunks ENABLE ROW LEVEL SECURITY;
 
 -- Policy: SELECT/INSERT/UPDATE/DELETE restricted to rows owned by the current researcher
 CREATE POLICY researcher_owns_chunks ON experiment_chunks
-    USING      (researcher_id = (
-        SELECT id FROM researchers
-        WHERE  auth0_sub = current_setting('app.researcher_id', true)
-    ))
-    WITH CHECK (researcher_id = (
-        SELECT id FROM researchers
-        WHERE  auth0_sub = current_setting('app.researcher_id', true)
-    ));
+    USING (
+        researcher_id = (
+            SELECT id FROM researchers
+            WHERE  auth0_sub = current_setting('app.researcher_id', true)
+        )
+        AND current_setting('app.researcher_id', true) IS NOT NULL
+    )
+    WITH CHECK (
+        researcher_id = (
+            SELECT id FROM researchers
+            WHERE  auth0_sub = current_setting('app.researcher_id', true)
+        )
+        AND current_setting('app.researcher_id', true) IS NOT NULL
+    );
 
 -- Application role — used by the API, does NOT bypass RLS
-CREATE ROLE platform_app LOGIN PASSWORD 'change_in_production';
+-- Password provisioned out-of-band via Secrets Manager after role creation:
+--   ALTER ROLE platform_app PASSWORD '<value-from-secrets-manager>';
+-- Never commit a password literal in DDL, even a placeholder.
+CREATE ROLE platform_app LOGIN;
 GRANT SELECT, INSERT, UPDATE ON experiment_chunks TO platform_app;
 GRANT SELECT ON researchers TO platform_app;
 GRANT USAGE ON SCHEMA public TO platform_app;
@@ -82,4 +91,4 @@ CREATE POLICY researcher_log ON query_log USING (
         WHERE  auth0_sub = current_setting('app.researcher_id', true)
     )
 );
-GRANT INSERT ON query_log TO platform_app;
+GRANT SELECT, INSERT ON query_log TO platform_app;

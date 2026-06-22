@@ -21,6 +21,8 @@ terraform.tfstate
 terraform.tfstate.backup
 *.tfplan
 *.tfvars
+*.auto.tfvars
+*.auto.tfvars.json
 !*.tfvars.example
 
 # Lambda build artifacts

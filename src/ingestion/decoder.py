@@ -2,19 +2,18 @@
 ECS Fargate entrypoint — downloads a binary instrument file from S3,
 decodes it into structured records, embeds each record, and writes to PostgreSQL.
 """
-import boto3
 import json
 import logging
-import numpy as np
 import os
 import struct
+
+import boto3
+import numpy as np
 import psycopg2
+from botocore.config import Config
 from dataclasses import dataclass
 
 log = logging.getLogger(__name__)
-
-s3      = boto3.client("s3")
-bedrock = boto3.client("bedrock-runtime", region_name=os.environ.get("AWS_REGION", "us-east-1"))
 
 
 @dataclass
@@ -39,7 +38,16 @@ INSTRUMENT_FORMATS = {
 
 
 def decode(raw_bytes: bytes, instrument_id: str) -> ExperimentRecord:
+    if instrument_id not in INSTRUMENT_FORMATS:
+        raise ValueError(
+            f"Unknown instrument_id {instrument_id!r}. Valid: {list(INSTRUMENT_FORMATS)}"
+        )
     fmt = INSTRUMENT_FORMATS[instrument_id]
+    if len(raw_bytes) < fmt["header_bytes"]:
+        raise ValueError(
+            f"File too short for instrument {instrument_id!r}: "
+            f"need {fmt['header_bytes']} bytes, got {len(raw_bytes)}"
+        )
     header = struct.unpack(fmt["header_fmt"], raw_bytes[:fmt["header_bytes"]])
     session_id, timestamp, channels, sample_rate, n_samples, _ = header
     payload = (
@@ -68,17 +76,17 @@ def to_text_chunk(record: ExperimentRecord) -> str:
     )
 
 
-def embed(text: str) -> list[float]:
-    resp = bedrock.invoke_model(
+def embed(text: str, bedrock_client) -> list[float]:
+    resp = bedrock_client.invoke_model(
         modelId="amazon.titan-embed-text-v2:0",
         body=json.dumps({"inputText": text}),
     )
     return json.loads(resp["body"].read())["embedding"]
 
 
-def write_to_db(conn, researcher_id: str, record: ExperimentRecord):
-    text  = to_text_chunk(record)
-    vec   = embed(text)
+def write_to_db(conn, researcher_id: str, record: ExperimentRecord, bedrock_client):
+    text = to_text_chunk(record)
+    vec  = embed(text, bedrock_client)
 
     with conn.cursor() as cur:
         cur.execute("""
@@ -110,6 +118,13 @@ def main():
     researcher_id = os.environ["RESEARCHER_ID"]
     db_url        = os.environ["DATABASE_URL"]
 
+    s3 = boto3.client("s3")
+    bedrock = boto3.client(
+        "bedrock-runtime",
+        region_name=os.environ.get("AWS_REGION", "us-east-1"),
+        config=Config(retries={"max_attempts": 3, "mode": "adaptive"}),
+    )
+
     log.info("Decoding s3://%s/%s", bucket, key)
     obj       = s3.get_object(Bucket=bucket, Key=key)
     raw_bytes = obj["Body"].read()
@@ -118,8 +133,10 @@ def main():
     log.info("Decoded: %s — %d channels, %.1fs", record.session_id, record.channel_count, record.duration_sec)
 
     conn = psycopg2.connect(db_url)
-    write_to_db(conn, researcher_id, record)
-    conn.close()
+    try:
+        write_to_db(conn, researcher_id, record, bedrock)
+    finally:
+        conn.close()
 
 
 if __name__ == "__main__":
